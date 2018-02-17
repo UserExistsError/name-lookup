@@ -15,6 +15,8 @@ Win7 name resolution order: hosts, DNS, LLMNR, NetBIOS
 
 LLMNR_PORT=5355
 LLMNR_GRP='224.0.0.252'         # this is the multicast address reserved for LLMNR
+MDNS_PORT=5353
+MDNS_GRP='224.0.0.251'          # multicast DNS
 
 class NBNSFlags(BigEndianStructure):
     _pack_ = 1
@@ -103,68 +105,99 @@ Opcode    {}
 Response  {}
 '''.format(self.reply_code, self.tentative, self.truncated, self.conflict, self.opcode, self.response)
 
-class DNSFlags(BigEndianStructure):
+class DNSHeader(BigEndianStructure):
     _pack_ = 1
     _fields_ = [
-        ('response', c_uint16, 1),
+        ('trans_id', c_uint16), # query/response identifier
+        ('qr', c_uint16, 1), # query or response
         ('opcode', c_uint16, 4),
-        ('reserved', c_uint16, 1),
-        ('truncated', c_uint16, 1),
-        ('recursion', c_uint16, 1),
-        ('reserved1', c_uint16, 3),
-        ('noauth', c_uint16, 1),
-        ('reserved2', c_uint16, 4),
+        ('aa', c_uint16, 1), # responding name server is authoritative
+        ('tc', c_uint16, 1), # truncated
+        ('rd', c_uint16, 1), # 
+        ('ra', c_uint16, 1), # recursion available
+        ('reserved', c_uint16, 2),
+        ('auth', c_uint16, 1),  # non-auth data acceptable
+        ('rcode', c_uint16, 4), # (0 good) (1 fmt err) (2 server err) (3 name err) (4 not impl) (5 refused)
+        ('qdcount', c_uint16),  # query count
+        ('ancount', c_uint16),  # answer count
+        ('nscount', c_uint16),  # name server count
+        ('arcount', c_uint16),  # addtl count
+        # followed by resource records
     ]
 
-def decode_dns_name(self, e):
+class MDNSHeader(DNSHeader):
+    pass
+
+class DNSQuery():
+    pass
+
+class DNSReponse():
+    pass
+
+
+def decode_dns_name(e):
     name = ''
     i = 0
-    while e[i]:
-        name += e[i+1:e[i]+1] + '.'
-        i = e[e[i]+2]
+    while e[i] != 0:
+        name += e[i+1:i+e[i]+1].decode() + '.'
+        print(name)
+        i += e[i]+1
     return name[:-1]
 
-class ResourceRecord():
-    def __init__(self, packet, data):
-        self.name, self._type, self._class, self.ttl, self.dlen = struct.unpack('>HHHLH', data)
-        self.data = data[12:12+self.dlen]
-        if self.name[0] == 0xc0:
-            # C0 can come after a CN too
-            self.name = decode_dns_name(packet[self.name[1]:])
+class DNSResourceRecord():
+    ''' https://www.ietf.org/rfc/rfc1035.txt '''
+    def __init__(self, data=None, response=True):
+        if data:
+            self.rname = decode_dns_name(data)
+            data = data[data.find(b'\x00')+1:-1]
+            self.rtype, self.rclass = struct.unpack('>HH', data)
+            self.length = len(self.rname) + 2 + 4
+            if response:
+                data = data[4:]
+                self.ttl, self.rlen = struct.unpack('>LH', data)
+                data = data[6:]
+                self.rdata = data[:self.rlen]
+                self.length += 6 + self.rlen
     def __len__(self):
-        return 12 + self.dlen
+        return self.length
 
-class DNSResponse():
+
+class MDNSResourceRecord(DNSResourceRecord):
+    def __init__(self, data=None, response=True):
+        super().__init__(data, response)
+        if data:
+            self.cache_flush = self.rclass >> 15
+            self.rclass = self.rclass & 0x7f
+
+
+class MDNSResponse():
     def __init__(self):
         pass
-    def from_data(self, data):
-        self.trans_id = struct.unpack('>H', data[0:2])[0]
-        self.flags = DNSFlags.from_buffer_copy(data[2:4])
-        self.query_count, self.answer_count, self.authority_count, self.additional_count = \
-            struct.unpack('>HHHH', data[4:12])
-        queries = data[12:]
-        for i in range(self.query_count):
-            name = decode_dns_name(queries)
-            typ, clas = struct.unpack('>HH', queries[len(name)+1:len(name)+5])
-            queries = queries[len(name)+5:]
+    def from_bytes(self, data):
+        self.header = MDNSHeader.from_buffer_copy(data[:36])
+        queries = data[36:]
+        for i in range(self.header.qdcount):
+            rec = MDNSResourceRecord(queries, self.header.response)
+            queries = queries[len(rec):]
         answers = queries
         self.answers = []
-        for i in range(self.answer_count):
-            rr = ResourceRecord(answers)
+        for i in range(self.header.ancount):
+            rr = MDNSResourceRecord(answers)
             self.answers.append(rr)
             answers = answers[len(rr):]
         authorities = answers
         self.authorities = []
-        for i in range(self.authority_count):
-            rr = ResourceRecord(authorities)
+        for i in range(self.header.nscount):
+            rr = MDNSResourceRecord(authorities)
             self.authorities.append(rr)
             authorities = authorities[len(rr):]
         additionals = authorities
         self.additionals = []
-        for i in range(self.additionals):
-            rr = ResourceRecord(additionals)
+        for i in range(self.header.arcount):
+            rr = MDSNResourceRecord(additionals)
             self.additionals.append(rr)
             additionals = additionals[len(rr):]
+
 
 class LLMNRQuery():
     qmap = {'A':1, 'IN':1}
@@ -207,6 +240,9 @@ class LLMNRResponse():
 
 
 class MDNSQuery():
+    pass
+
+class MDNSResponse():
     pass
 
 def send_llmnr(hostname, timeout=1, qtype='A', qclass='IN'):
@@ -310,14 +346,14 @@ if __name__ == '__main__':
                 a2 = send_nbns(random_hostname(), args.netbios, args.timeout)
                 if a2:
                     if a1.addrs[0] == a2.addrs[0]:
-                        print('[!] Responder detected with NetBIOS')
+                        print('[!] Responder detected with NetBIOS. Poisoned answer resolves to '+a1.addrs[0])
         elif args.llmnr:
             a1 = send_llmnr(random_hostname(), args.timeout)
             if a1:
                 a2 = send_llmnr(random_hostname(), args.timeout)
                 if a2:
                     if a1.addrs[0] == a2.addrs[0]:
-                        print('[!] Responder detected with LLMNR')
+                        print('[!] Responder detected with LLMNR. Poisoned answer resolves to '+a1.addrs[0])
     if args.hostname:
         if args.netbios:
             a = send_nbns(args.hostname, args.netbios, args.timeout, args.qtype, args.qclass, args.service)
